@@ -2,6 +2,7 @@
 Proves no agent is double-assigned under concurrent load.
 Run after `docker compose up`:   python scripts/concurrency_test.py
 Needs: pip install httpx
+Logs in as the seeded admin (admin@example.com / admin123).
 """
 import asyncio
 import random
@@ -16,6 +17,10 @@ N_ORDERS = 100  # more orders than agents on purpose -> some must get 409
 
 async def main():
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
+        login = await c.post("/auth/login", json={"email": "admin@example.com", "password": "admin123"})
+        login.raise_for_status()
+        c.headers["Authorization"] = f"Bearer {login.json()['access_token']}"
+
         # Bangalore-ish coordinates
         for i in range(N_AGENTS):
             a = (await c.post("/agents", json={"name": f"agent-{i}"})).json()
