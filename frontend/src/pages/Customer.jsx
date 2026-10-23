@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import OrderTable from "./OrderTable.jsx";
+import Tracker from "./Tracker.jsx";
 
 const START = { pickup_lat: "12.9716", pickup_lng: "77.5946", dropoff_lat: "12.9352", dropoff_lng: "77.6245" };
 
@@ -41,11 +42,14 @@ export default function Customer() {
     }
   }
 
+  // Orders come newest first, so this is your most recent order that has an agent on the way
+  const active = orders.find((o) => o.agent_id && ["assigned", "picked_up"].includes(o.status));
+
   return (
     <>
       <form className="panel" onSubmit={submit}>
         <h1>Place an order</h1>
-        <p className="muted">Coordinates are prefilled with two Bangalore points. A map picker comes in Week 3.</p>
+        <p className="muted">Coordinates are prefilled with two Bangalore points.</p>
         <div className="grid4">
           <label>Pickup latitude<input value={form.pickup_lat} onChange={set("pickup_lat")} required /></label>
           <label>Pickup longitude<input value={form.pickup_lng} onChange={set("pickup_lng")} required /></label>
@@ -55,6 +59,8 @@ export default function Customer() {
         {error && <p className="error" role="alert">{error}</p>}
         <button className="primary" disabled={busy}>{busy ? "Placing…" : "Place order"}</button>
       </form>
+
+      {active && <Tracker key={active.id} order={active} />}
 
       <section className="panel">
         <h2>Your orders</h2>

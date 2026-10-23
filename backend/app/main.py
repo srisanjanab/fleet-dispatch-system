@@ -1,8 +1,13 @@
+import asyncio
+import json
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import asyncpg
 import jwt
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
@@ -14,6 +19,9 @@ from .auth import (
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://dispatch:dispatch@localhost:5432/dispatch")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@example.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # dev default only
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+CHANNEL = "agent_events"  # Redis pub/sub channel for live agent updates
+logger = logging.getLogger("dispatch")
 
 USERS_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -32,6 +40,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_id INT REFERENCES users(id)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=20)
+    app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     async with app.state.pool.acquire() as conn:
         await conn.execute(USERS_DDL)  # idempotent: safe on every startup
         exists = await conn.fetchval("SELECT 1 FROM users WHERE email=$1", ADMIN_EMAIL)
@@ -41,10 +50,56 @@ async def lifespan(app: FastAPI):
                 ADMIN_EMAIL, hash_password(ADMIN_PASSWORD),
             )
     yield
+    await app.state.redis.aclose()
     await app.state.pool.close()
 
 
 app = FastAPI(title="Fleet Dispatch System", lifespan=lifespan)
+
+
+async def publish(event: dict) -> None:
+    """Best-effort live update. A Redis hiccup must never break dispatching itself."""
+    try:
+        await app.state.redis.publish(CHANNEL, json.dumps(event))
+    except Exception:
+        logger.warning("Failed to publish live event", exc_info=True)
+
+
+async def stream_events(ws: WebSocket, allow) -> None:
+    """
+    Forward Redis pub/sub events to one WebSocket client until either side goes away.
+    `allow(event)` decides whether this client is permitted to see an event.
+    Each connection gets its own Redis subscription, so this works across several API servers.
+    """
+    pubsub = app.state.redis.pubsub()
+    await pubsub.subscribe(CHANNEL)
+
+    async def forward():
+        try:
+            async for msg in pubsub.listen():
+                if msg["type"] != "message":
+                    continue
+                event = json.loads(msg["data"])
+                if allow(event):
+                    await ws.send_json(event)
+        except Exception:
+            pass  # client went away mid-send; the other task ends the session
+
+    async def watch_disconnect():
+        try:
+            while True:
+                await ws.receive_text()  # we ignore content; this just notices the disconnect
+        except WebSocketDisconnect:
+            pass
+
+    tasks = [asyncio.create_task(forward()), asyncio.create_task(watch_disconnect())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        await pubsub.unsubscribe(CHANNEL)
+        await pubsub.aclose()
 
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
@@ -176,6 +231,7 @@ async def set_agent_status(agent_id: int, body: StatusUpdate, user: dict = Depen
     )
     if not row:
         raise HTTPException(404, "Agent not found")
+    await publish({"type": "status", "agent_id": agent_id, "status": body.status})
     return dict(row)
 
 
@@ -201,18 +257,19 @@ async def _save_location(agent_id: int, lat: float, lng: float):
                 f"INSERT INTO location_history (agent_id, location) VALUES ($1, {point('$3', '$2')})",
                 agent_id, lat, lng,
             )
+    await publish({"type": "location", "agent_id": agent_id, "lat": lat, "lng": lng, "ts": time.time()})
 
 
 @app.websocket("/ws/agents/{agent_id}")
 async def agent_socket(ws: WebSocket, agent_id: int, token: str = ""):
     """Connect with ?token=<jwt>. Agent app sends {"lat": .., "lng": ..} every few seconds."""
+    await ws.accept()  # accept first: a close before accept becomes a bare HTTP 403 in the browser
     try:
         user = decode_token(token)
         ensure_self_or_admin(user, agent_id)
     except (jwt.PyJWTError, HTTPException):
         await ws.close(code=4401)  # custom close code: unauthorized
         return
-    await ws.accept()
     try:
         while True:
             data = await ws.receive_json()
@@ -221,6 +278,55 @@ async def agent_socket(ws: WebSocket, agent_id: int, token: str = ""):
             await ws.send_json({"ack": True})
     except WebSocketDisconnect:
         pass
+
+
+# ---------- Live feeds ----------
+@app.websocket("/ws/live")
+async def live_feed(ws: WebSocket, token: str = ""):
+    """Admin-only firehose: every agent's location and status changes."""
+    await ws.accept()
+    try:
+        user = decode_token(token)
+    except jwt.PyJWTError:
+        await ws.close(code=4401)
+        return
+    if user["role"] != "admin":
+        await ws.close(code=4403)
+        return
+    await stream_events(ws, lambda event: True)
+
+
+@app.websocket("/ws/orders/{order_id}/track")
+async def track_order(ws: WebSocket, order_id: int, token: str = ""):
+    """A customer (or admin) follows the one agent assigned to their order. Nobody else's agents leak through."""
+    await ws.accept()
+    try:
+        user = decode_token(token)
+    except jwt.PyJWTError:
+        await ws.close(code=4401)
+        return
+
+    row = await app.state.pool.fetchrow(ORDER_SELECT + " WHERE o.id = $1", order_id)
+    allowed = row is not None and (
+        user["role"] == "admin" or (user["role"] == "customer" and row["customer_id"] == user["id"])
+    )
+    if not allowed:
+        await ws.close(code=4403)
+        return
+    agent_id = row["agent_id"]
+    if agent_id is None:
+        await ws.close(code=4404)  # nobody assigned yet
+        return
+
+    # Send the last known position right away so the map isn't empty until the next ping
+    start = await app.state.pool.fetchrow(
+        "SELECT ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng FROM agents WHERE id=$1",
+        agent_id,
+    )
+    if start and start["lat"] is not None:
+        await ws.send_json({"type": "location", "agent_id": agent_id, "lat": start["lat"], "lng": start["lng"]})
+
+    await stream_events(ws, lambda event: event.get("agent_id") == agent_id)
 
 
 # ---------- Orders ----------
@@ -314,6 +420,7 @@ async def assign_order(order_id: int, user: dict = Depends(require_roles("admin"
                 "INSERT INTO assignments (order_id, agent_id) VALUES ($1, $2)", order_id, agent["id"]
             )
 
+    await publish({"type": "status", "agent_id": agent["id"], "status": "busy"})
     return {"order_id": order_id, "agent_id": agent["id"], "agent_name": agent["name"]}
 
 
@@ -333,4 +440,5 @@ async def complete_order(order_id: int, user: dict = Depends(require_roles("admi
             await conn.execute(
                 "UPDATE agents SET status='available', updated_at=now() WHERE id=$1", assignment["agent_id"]
             )
+    await publish({"type": "status", "agent_id": assignment["agent_id"], "status": "available"})
     return {"order_id": order_id, "status": "delivered"}

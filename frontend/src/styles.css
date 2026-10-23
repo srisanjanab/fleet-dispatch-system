@@ -100,3 +100,13 @@ th { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
   main { margin-top: 1rem; }
   .topbar { padding: 0.75rem 1rem; }
 }
+
+/* ---- Week 3: map, legend, live badge ---- */
+.map { width: 100%; border: 1px solid var(--line); border-radius: 8px; z-index: 0; }
+.legend { display: flex; gap: 1.25rem; flex-wrap: wrap; font-size: 0.9rem; color: var(--muted); margin: 0.6rem 0 1rem; }
+.dot { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 50%; margin-right: 0.35rem; vertical-align: -0.1rem; }
+.spread { justify-content: space-between; align-items: center; }
+.badge { padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.85rem; font-weight: 600; background: #e8edeb; color: var(--muted); }
+.badge.live { background: #dff3e7; color: var(--ok); }
+.badge.reconnecting, .badge.connecting { background: #fdebc8; color: var(--warn); }
+.badge.closed { background: #f9dedc; color: var(--bad); }
