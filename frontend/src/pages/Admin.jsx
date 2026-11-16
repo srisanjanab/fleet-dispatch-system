@@ -36,7 +36,7 @@ export default function Admin() {
         return a;
       })
     );
-    if (event.type === "status") load(); // statuses change when orders move, so refresh orders too
+    if (event.type === "status" || event.type === "order") load(); // order state changed: refresh the lists
   });
 
   async function assign(id) {
@@ -117,7 +117,7 @@ export default function Admin() {
           orders={orders}
           empty="No orders yet."
           renderAction={(o) =>
-            o.status === "created" && <button className="primary" onClick={() => assign(o.id)}>Assign nearest agent</button>
+            o.status === "created" && <button className="primary" onClick={() => assign(o.id)}>Dispatch now</button>
           }
         />
       </section>

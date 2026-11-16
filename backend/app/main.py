@@ -22,6 +22,9 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # dev default only
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 CHANNEL = "agent_events"  # Redis pub/sub channel for live agent updates
 logger = logging.getLogger("dispatch")
+OFFER_TIMEOUT = int(os.getenv("OFFER_TIMEOUT_SECONDS", "30"))   # how long an agent has to accept
+DISPATCH_INTERVAL = float(os.getenv("DISPATCH_INTERVAL_SECONDS", "2"))
+AUTO_DISPATCH = os.getenv("AUTO_DISPATCH", "true").lower() == "true"
 
 USERS_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -34,6 +37,25 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_id INT REFERENCES users(id);
+
+-- Week 4: an order is first OFFERED to an agent; it becomes an assignment only when they accept.
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
+ALTER TABLE orders ADD CONSTRAINT orders_status_check
+    CHECK (status IN ('created', 'offered', 'assigned', 'picked_up', 'delivered', 'cancelled'));
+
+CREATE TABLE IF NOT EXISTS offers (
+    id          SERIAL PRIMARY KEY,
+    order_id    INT NOT NULL REFERENCES orders(id),
+    agent_id    INT NOT NULL REFERENCES agents(id),
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'accepted', 'rejected', 'expired')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    UNIQUE (order_id, agent_id)  -- the same agent is never offered the same order twice
+);
+-- At most one live offer per order, enforced by the database itself
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_offer_per_order ON offers (order_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_offers_pending_expiry ON offers (expires_at) WHERE status = 'pending';
 """
 
 
@@ -49,7 +71,10 @@ async def lifespan(app: FastAPI):
                 "INSERT INTO users (email, name, password_hash, role) VALUES ($1, 'Admin', $2, 'admin')",
                 ADMIN_EMAIL, hash_password(ADMIN_PASSWORD),
             )
+    dispatcher = asyncio.create_task(dispatcher_loop()) if AUTO_DISPATCH else None
     yield
+    if dispatcher:
+        dispatcher.cancel()
     await app.state.redis.aclose()
     await app.state.pool.close()
 
@@ -102,6 +127,120 @@ async def stream_events(ws: WebSocket, allow) -> None:
         await pubsub.aclose()
 
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+
+# ---------- Dispatch engine ----------
+async def dispatch_order(conn, order_id: int):
+    """
+    Offer one waiting order to the nearest available agent who has not already been offered it.
+    MUST run inside a transaction. Returns an offer dict, or "not_waiting" / "no_agent".
+
+    - FOR UPDATE SKIP LOCKED on the order : if another server is already dispatching it, skip it
+    - ORDER BY location <-> pickup        : nearest-first using the GiST index
+    - FOR UPDATE SKIP LOCKED on the agent : two orders can never claim the same agent at once
+    - NOT EXISTS (offers ...)             : never offer the same order to the same agent twice
+    """
+    order = await conn.fetchrow(
+        "SELECT id FROM orders WHERE id=$1 AND status='created' FOR UPDATE SKIP LOCKED", order_id
+    )
+    if not order:
+        return "not_waiting"
+
+    agent = await conn.fetchrow(
+        """SELECT a.id, a.name
+           FROM agents a, orders o
+           WHERE o.id = $1
+             AND a.status = 'available'
+             AND a.location IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM offers f WHERE f.order_id = o.id AND f.agent_id = a.id)
+           ORDER BY a.location <-> o.pickup
+           LIMIT 1
+           FOR UPDATE OF a SKIP LOCKED""",
+        order_id,
+    )
+    if not agent:
+        return "no_agent"
+
+    await conn.execute("UPDATE agents SET status='busy', updated_at=now() WHERE id=$1", agent["id"])
+    await conn.execute("UPDATE orders SET status='offered' WHERE id=$1", order_id)
+    offer_id = await conn.fetchval(
+        """INSERT INTO offers (order_id, agent_id, expires_at)
+           VALUES ($1, $2, now() + make_interval(secs => $3)) RETURNING id""",
+        order_id, agent["id"], float(OFFER_TIMEOUT),
+    )
+    return {"offer_id": offer_id, "order_id": order_id, "agent_id": agent["id"], "agent_name": agent["name"]}
+
+
+async def release_offer(conn, offer, new_status: str) -> None:
+    """Close an offer (rejected / expired): the order goes back in the queue and the agent is free again."""
+    await conn.execute("UPDATE offers SET status=$2 WHERE id=$1", offer["id"], new_status)
+    await conn.execute("UPDATE orders SET status='created' WHERE id=$1 AND status='offered'", offer["order_id"])
+    await conn.execute(
+        "UPDATE agents SET status='available', updated_at=now() WHERE id=$1 AND status='busy'",
+        offer["agent_id"],
+    )
+
+
+async def announce_offer(o: dict) -> None:
+    await publish({"type": "status", "agent_id": o["agent_id"], "status": "busy"})
+    await publish({"type": "order", "order_id": o["order_id"], "status": "offered"})
+    await publish({"type": "offer", "agent_id": o["agent_id"], "offer_id": o["offer_id"],
+                   "order_id": o["order_id"], "state": "pending"})
+
+
+async def announce_release(offer, new_status: str) -> None:
+    await publish({"type": "status", "agent_id": offer["agent_id"], "status": "available"})
+    await publish({"type": "order", "order_id": offer["order_id"], "status": "created"})
+    await publish({"type": "offer", "agent_id": offer["agent_id"], "offer_id": offer["id"],
+                   "order_id": offer["order_id"], "state": new_status})
+
+
+async def dispatch_in_tx(order_id: int):
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            result = await dispatch_order(conn, order_id)
+    if isinstance(result, dict):
+        await announce_offer(result)
+    return result
+
+
+async def expire_offers() -> None:
+    """Offers nobody answered in time go back to the queue. SKIP LOCKED lets several servers run this safely."""
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """SELECT id, order_id, agent_id FROM offers
+                   WHERE status='pending' AND expires_at <= now()
+                   FOR UPDATE SKIP LOCKED"""
+            )
+            for r in rows:
+                await release_offer(conn, r, "expired")
+    for r in rows:
+        await announce_release(r, "expired")
+
+
+async def dispatch_waiting() -> None:
+    """Try to offer every waiting order (oldest first). This is the waiting queue."""
+    free = await app.state.pool.fetchval(
+        "SELECT count(*) FROM agents WHERE status='available' AND location IS NOT NULL"
+    )
+    if not free:
+        return
+    waiting = await app.state.pool.fetch("SELECT id FROM orders WHERE status='created' ORDER BY id LIMIT 50")
+    for row in waiting:
+        await dispatch_in_tx(row["id"])
+
+
+async def dispatcher_loop() -> None:
+    while True:
+        try:
+            await expire_offers()
+            await dispatch_waiting()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Dispatcher tick failed; will retry")
+        await asyncio.sleep(DISPATCH_INTERVAL)
 
 
 # ---------- Schemas ----------
@@ -385,43 +524,22 @@ async def get_order(order_id: int, user: dict = Depends(current_user)):
 @app.post("/orders/{order_id}/assign")
 async def assign_order(order_id: int, user: dict = Depends(require_roles("admin"))):
     """
-    Core algorithm: find the nearest AVAILABLE agent and claim them atomically.
-
-    - ORDER BY location <-> pickup : KNN search using the GiST index
-    - FOR UPDATE SKIP LOCKED       : if another transaction is already claiming an agent,
-                                     skip that row and take the next-nearest.
-                                     This is what prevents double-assignment under load.
+    Manual "dispatch now" for admins. The background dispatcher does this automatically.
+    The order is OFFERED to the nearest available agent, who then has OFFER_TIMEOUT seconds to accept.
     """
-    async with app.state.pool.acquire() as conn:
-        async with conn.transaction():
-            order = await conn.fetchrow(
-                "SELECT id FROM orders WHERE id=$1 AND status='created' FOR UPDATE", order_id
-            )
-            if not order:
-                raise HTTPException(409, "Order not found or already assigned")
-
-            agent = await conn.fetchrow(
-                """SELECT a.id, a.name
-                   FROM agents a, orders o
-                   WHERE o.id = $1
-                     AND a.status = 'available'
-                     AND a.location IS NOT NULL
-                   ORDER BY a.location <-> o.pickup
-                   LIMIT 1
-                   FOR UPDATE OF a SKIP LOCKED""",
-                order_id,
-            )
-            if not agent:
-                raise HTTPException(409, "No available agents")
-
-            await conn.execute("UPDATE agents SET status='busy', updated_at=now() WHERE id=$1", agent["id"])
-            await conn.execute("UPDATE orders SET status='assigned' WHERE id=$1", order_id)
-            await conn.execute(
-                "INSERT INTO assignments (order_id, agent_id) VALUES ($1, $2)", order_id, agent["id"]
-            )
-
-    await publish({"type": "status", "agent_id": agent["id"], "status": "busy"})
-    return {"order_id": order_id, "agent_id": agent["id"], "agent_name": agent["name"]}
+    result = await dispatch_in_tx(order_id)
+    if result == "not_waiting":
+        raise HTTPException(409, "Order not found, or it is already offered or assigned")
+    if result == "no_agent":
+        raise HTTPException(409, "No available agents")
+    return {
+        "order_id": order_id,
+        "agent_id": result["agent_id"],
+        "agent_name": result["agent_name"],
+        "offer_id": result["offer_id"],
+        "status": "offered",
+        "expires_in_seconds": OFFER_TIMEOUT,
+    }
 
 
 @app.post("/orders/{order_id}/complete")
@@ -441,4 +559,91 @@ async def complete_order(order_id: int, user: dict = Depends(require_roles("admi
                 "UPDATE agents SET status='available', updated_at=now() WHERE id=$1", assignment["agent_id"]
             )
     await publish({"type": "status", "agent_id": assignment["agent_id"], "status": "available"})
+    await publish({"type": "order", "order_id": order_id, "status": "delivered"})
     return {"order_id": order_id, "status": "delivered"}
+
+
+# ---------- Offers ----------
+OFFER_SELECT = """
+    SELECT f.id, f.order_id, f.agent_id, a.name AS agent_name, o.customer_name,
+           GREATEST(EXTRACT(EPOCH FROM (f.expires_at - now())), 0)::float AS seconds_left,
+           ST_Y(o.pickup::geometry)  AS pickup_lat,  ST_X(o.pickup::geometry)  AS pickup_lng,
+           ST_Y(o.dropoff::geometry) AS dropoff_lat, ST_X(o.dropoff::geometry) AS dropoff_lng
+    FROM offers f
+    JOIN orders o ON o.id = f.order_id
+    JOIN agents a ON a.id = f.agent_id
+    WHERE f.status = 'pending' AND f.expires_at > now()
+"""
+
+
+@app.get("/offers/mine")
+async def my_offers(user: dict = Depends(require_roles("agent"))):
+    rows = await app.state.pool.fetch(OFFER_SELECT + " AND f.agent_id = $1 ORDER BY f.id", user["agent_id"])
+    return [dict(r) for r in rows]
+
+
+@app.get("/offers/pending")
+async def pending_offers(user: dict = Depends(require_roles("admin"))):
+    rows = await app.state.pool.fetch(OFFER_SELECT + " ORDER BY f.id")
+    return [dict(r) for r in rows]
+
+
+async def _lock_offer(conn, offer_id: int, user: dict):
+    offer = await conn.fetchrow(
+        """SELECT id, order_id, agent_id, status, (expires_at > now()) AS live
+           FROM offers WHERE id=$1 FOR UPDATE""",
+        offer_id,
+    )
+    if not offer:
+        raise HTTPException(404, "Offer not found")
+    if user["role"] == "agent" and offer["agent_id"] != user["agent_id"]:
+        raise HTTPException(403, "This offer is not yours")
+    return offer
+
+
+@app.post("/offers/{offer_id}/accept")
+async def accept_offer(offer_id: int, user: dict = Depends(require_roles("agent", "admin"))):
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            # The row lock decides races: if the expiry job got here first we see status='expired'
+            offer = await _lock_offer(conn, offer_id, user)
+            if offer["status"] != "pending" or not offer["live"]:
+                raise HTTPException(409, "This offer is no longer available (it expired or was already answered)")
+            await conn.execute("UPDATE offers SET status='accepted' WHERE id=$1", offer_id)
+            await conn.execute("UPDATE orders SET status='assigned' WHERE id=$1", offer["order_id"])
+            await conn.execute(
+                "INSERT INTO assignments (order_id, agent_id) VALUES ($1, $2)", offer["order_id"], offer["agent_id"]
+            )
+    await publish({"type": "order", "order_id": offer["order_id"], "status": "assigned"})
+    await publish({"type": "offer", "agent_id": offer["agent_id"], "offer_id": offer_id,
+                   "order_id": offer["order_id"], "state": "accepted"})
+    return {"order_id": offer["order_id"], "status": "assigned"}
+
+
+@app.post("/offers/{offer_id}/reject")
+async def reject_offer(offer_id: int, user: dict = Depends(require_roles("agent", "admin"))):
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            offer = await _lock_offer(conn, offer_id, user)
+            if offer["status"] != "pending":
+                raise HTTPException(409, "This offer was already answered or has expired")
+            await release_offer(conn, offer, "rejected")
+    await announce_release(offer, "rejected")
+    await dispatch_in_tx(offer["order_id"])  # straight to the next-nearest agent, no waiting for the next tick
+    return {"order_id": offer["order_id"], "status": "rejected"}
+
+
+@app.websocket("/ws/me")
+async def my_feed(ws: WebSocket, token: str = ""):
+    """An agent's private feed: only offer events addressed to them."""
+    await ws.accept()
+    try:
+        user = decode_token(token)
+    except jwt.PyJWTError:
+        await ws.close(code=4401)
+        return
+    if user["role"] != "agent":
+        await ws.close(code=4403)
+        return
+    agent_id = user["agent_id"]
+    await stream_events(ws, lambda e: e.get("type") == "offer" and e.get("agent_id") == agent_id)

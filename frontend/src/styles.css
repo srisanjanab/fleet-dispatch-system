@@ -110,3 +110,7 @@ th { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
 .badge.live { background: #dff3e7; color: var(--ok); }
 .badge.reconnecting, .badge.connecting { background: #fdebc8; color: var(--warn); }
 .badge.closed { background: #f9dedc; color: var(--bad); }
+
+/* ---- Week 4: offers ---- */
+.panel.offer { border-color: var(--route); border-width: 2px; }
+.pill.offered { background: #e6e0f7; color: #4b2fa0; }
