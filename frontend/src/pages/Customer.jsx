@@ -42,6 +42,16 @@ export default function Customer() {
     }
   }
 
+  async function cancel(id) {
+    setError("");
+    try {
+      await api(`/orders/${id}/cancel`, { method: "POST" });
+    } catch (err) {
+      setError(err.message);
+    }
+    await load();
+  }
+
   // Orders come newest first, so this is your most recent order that has an agent on the way
   const active = orders.find((o) => o.agent_id && ["assigned", "picked_up"].includes(o.status));
 
@@ -64,7 +74,15 @@ export default function Customer() {
 
       <section className="panel">
         <h2>Your orders</h2>
-        <OrderTable orders={orders} empty="No orders yet. Place your first one above." />
+        <OrderTable
+          orders={orders}
+          empty="No orders yet. Place your first one above."
+          renderAction={(o) =>
+            ["created", "offered", "assigned"].includes(o.status) && (
+              <button onClick={() => cancel(o.id)}>Cancel</button>
+            )
+          }
+        />
       </section>
     </>
   );

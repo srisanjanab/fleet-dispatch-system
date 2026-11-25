@@ -59,9 +59,20 @@ CREATE INDEX IF NOT EXISTS idx_offers_pending_expiry ON offers (expires_at) WHER
 """
 
 
+async def connect_with_retry():
+    """Wait for Postgres instead of crashing if it is still starting (common right after Docker boots)."""
+    for attempt in range(1, 31):
+        try:
+            return await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=20)
+        except (OSError, asyncpg.PostgresError) as err:
+            logger.warning("Database not ready (attempt %d/30): %s", attempt, err)
+            await asyncio.sleep(2)
+    raise RuntimeError("Could not connect to the database after 30 attempts")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=20)
+    app.state.pool = await connect_with_retry()
     app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     async with app.state.pool.acquire() as conn:
         await conn.execute(USERS_DDL)  # idempotent: safe on every startup
@@ -551,16 +562,78 @@ async def complete_order(order_id: int, user: dict = Depends(require_roles("admi
             if user["role"] == "agent" and (not assignment or assignment["agent_id"] != user["agent_id"]):
                 raise HTTPException(403, "Not your order")
             row = await conn.fetchrow(
-                "UPDATE orders SET status='delivered' WHERE id=$1 AND status='assigned' RETURNING id", order_id
+                "UPDATE orders SET status='delivered' WHERE id=$1 AND status IN ('assigned', 'picked_up') RETURNING id", order_id
             )
             if not row:
-                raise HTTPException(409, "Order not in assigned state")
+                raise HTTPException(409, "Order is not in progress")
             await conn.execute(
                 "UPDATE agents SET status='available', updated_at=now() WHERE id=$1", assignment["agent_id"]
             )
     await publish({"type": "status", "agent_id": assignment["agent_id"], "status": "available"})
     await publish({"type": "order", "order_id": order_id, "status": "delivered"})
     return {"order_id": order_id, "status": "delivered"}
+
+
+@app.post("/orders/{order_id}/pickup")
+async def pickup_order(order_id: int, user: dict = Depends(require_roles("admin", "agent"))):
+    """Agent confirms they have collected the parcel: assigned -> picked_up."""
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            assignment = await conn.fetchrow("SELECT agent_id FROM assignments WHERE order_id=$1", order_id)
+            if user["role"] == "agent" and (not assignment or assignment["agent_id"] != user["agent_id"]):
+                raise HTTPException(403, "Not your order")
+            row = await conn.fetchrow(
+                "UPDATE orders SET status='picked_up' WHERE id=$1 AND status='assigned' RETURNING id", order_id
+            )
+            if not row:
+                raise HTTPException(409, "Order is not waiting for pickup")
+    await publish({"type": "order", "order_id": order_id, "status": "picked_up"})
+    return {"order_id": order_id, "status": "picked_up"}
+
+
+@app.post("/orders/{order_id}/cancel")
+async def cancel_order(order_id: int, user: dict = Depends(require_roles("customer", "admin"))):
+    """
+    Cancel an order that has not been picked up yet. Any live offer is closed and any agent holding
+    the order is freed.
+
+    Lock order matters: every code path in this app locks OFFERS first, then the ORDER, then the AGENT.
+    Taking locks in the same order everywhere is what prevents deadlocks (accept-vs-cancel, for example).
+    """
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            offers = await conn.fetch(
+                "SELECT id, agent_id FROM offers WHERE order_id=$1 AND status='pending' FOR UPDATE", order_id
+            )
+            order = await conn.fetchrow(
+                "SELECT id, status, customer_id FROM orders WHERE id=$1 FOR UPDATE", order_id
+            )
+            if not order:
+                raise HTTPException(404, "Order not found")
+            if user["role"] == "customer" and order["customer_id"] != user["id"]:
+                raise HTTPException(403, "Not your order")
+            if order["status"] not in ("created", "offered", "assigned"):
+                raise HTTPException(409, "This order can no longer be cancelled")
+
+            agent_ids = {o["agent_id"] for o in offers}
+            assignment = await conn.fetchrow("SELECT agent_id FROM assignments WHERE order_id=$1", order_id)
+            if assignment:
+                agent_ids.add(assignment["agent_id"])
+
+            await conn.execute("UPDATE offers SET status='expired' WHERE order_id=$1 AND status='pending'", order_id)
+            for agent_id in agent_ids:
+                await conn.execute(
+                    "UPDATE agents SET status='available', updated_at=now() WHERE id=$1 AND status='busy'", agent_id
+                )
+            await conn.execute("UPDATE orders SET status='cancelled' WHERE id=$1", order_id)
+
+    for o in offers:
+        await publish({"type": "offer", "agent_id": o["agent_id"], "offer_id": o["id"],
+                       "order_id": order_id, "state": "expired"})
+    for agent_id in agent_ids:
+        await publish({"type": "status", "agent_id": agent_id, "status": "available"})
+    await publish({"type": "order", "order_id": order_id, "status": "cancelled"})
+    return {"order_id": order_id, "status": "cancelled"}
 
 
 # ---------- Offers ----------

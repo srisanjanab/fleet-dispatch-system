@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import LiveMap, { COLORS } from "../LiveMap.jsx";
 import { useSocket } from "../useSocket.js";
-import { distanceKm } from "../geo.js";
+import { distanceKm, etaMinutes } from "../geo.js";
 
 export default function Tracker({ order }) {
   const [pos, setPos] = useState(null);
@@ -23,6 +23,12 @@ export default function Tracker({ order }) {
     [pos, order.id]
   );
 
+  // Before pickup the agent is heading to the pickup point; after pickup, to the drop-off
+  const pickedUp = order.status === "picked_up";
+  const target = pickedUp ? dropoff : pickup;
+  const targetName = pickedUp ? "drop-off point" : "pickup point";
+  const km = pos ? distanceKm(pos, target) : null;
+
   return (
     <section className="panel">
       <h2>Tracking order #{order.id}</h2>
@@ -31,10 +37,11 @@ export default function Tracker({ order }) {
         {state === "closed" && "Live tracking isn't available for this order."}
         {(state === "live" || state === "connecting") &&
           (pos
-            ? `Your agent is ${distanceKm(pos, pickup).toFixed(1)} km from the pickup point (straight-line distance).`
+            ? `${pickedUp ? "Your parcel is on its way." : "Your agent is heading to the pickup."} About ${km.toFixed(1)} km from the ${targetName}, roughly ${etaMinutes(km)} min away.`
             : "Waiting for your agent to share a location…")}
       </p>
       <LiveMap markers={markers} />
+      <p className="muted small">Estimate based on straight-line distance, adjusted for roads, at an average city speed.</p>
       <p className="legend">
         <span><i className="dot" style={{ background: COLORS.busy }} />Your agent</span>
         <span><i className="dot" style={{ background: COLORS.pickup }} />Pickup</span>

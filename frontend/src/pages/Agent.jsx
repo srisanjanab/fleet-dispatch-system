@@ -114,6 +114,8 @@ export default function Agent() {
 
   const accept = (id) => run(() => api(`/offers/${id}/accept`, { method: "POST" }), "Order accepted. Head to the pickup point.");
   const reject = (id) => run(() => api(`/offers/${id}/reject`, { method: "POST" }), "Offer declined. It goes to the next agent.");
+  const pickup = (id) =>
+    run(() => api(`/orders/${id}/pickup`, { method: "POST" }), `Order #${id} picked up. Head to the drop-off point.`);
   const complete = (id) =>
     run(() => api(`/orders/${id}/complete`, { method: "POST" }), `Order #${id} marked delivered.`);
 
@@ -185,7 +187,8 @@ export default function Agent() {
           orders={orders}
           empty="No orders assigned to you yet."
           renderAction={(o) =>
-            o.status === "assigned" && <button onClick={() => complete(o.id)}>Mark delivered</button>
+            (o.status === "assigned" && <button className="primary" onClick={() => pickup(o.id)}>Picked up</button>) ||
+            (o.status === "picked_up" && <button className="primary" onClick={() => complete(o.id)}>Mark delivered</button>)
           }
         />
       </section>

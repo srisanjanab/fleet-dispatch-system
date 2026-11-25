@@ -50,7 +50,10 @@ async def respond(c: httpx.AsyncClient, offer: dict):
                 print(f"  order #{oid}: {name} answered too late ({r.json().get('detail')})")
                 return
             print(f"  order #{oid}: {name} ACCEPTED")
-            await asyncio.sleep(random.uniform(10, 20))
+            await asyncio.sleep(random.uniform(6, 12))
+            await c.post(f"/orders/{oid}/pickup")
+            print(f"  order #{oid}: PICKED UP by {name}")
+            await asyncio.sleep(random.uniform(8, 15))
             await c.post(f"/orders/{oid}/complete")
             print(f"  order #{oid}: DELIVERED by {name}")
         elif roll < 0.85:
@@ -105,7 +108,7 @@ async def main(n: int, order_interval: float):
 
         # Clean slate: finish any order a sim agent was left holding, so they aren't stuck "busy"
         for o in (await c.get("/orders")).json():
-            if o["status"] == "assigned" and o["agent_id"] in sim_ids:
+            if o["status"] in ("assigned", "picked_up") and o["agent_id"] in sim_ids:
                 await c.post(f"/orders/{o['id']}/complete")
 
         for agent_id in ids:
