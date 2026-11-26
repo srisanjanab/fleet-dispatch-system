@@ -1,5 +1,7 @@
 # Fleet Dispatch System
 
+![CI](https://github.com/srisanjanab/fleet-dispatch-system/actions/workflows/ci.yml/badge.svg)
+
 A real-time delivery dispatch platform. Customers place orders, the system offers each order to the
 nearest available driver, drivers accept or decline within a time limit, and everyone watches live
 positions on a map.
@@ -14,6 +16,7 @@ positions on a map.
 - **Offers with a 30-second timeout.** An agent can accept, reject, or ignore. Rejected or expired offers
   automatically go to the next-nearest agent, and the same agent is never offered the same order twice.
 - **Waiting queue.** If no agent is free, orders wait and are offered as soon as someone becomes available.
+- **Full order lifecycle:** offered, assigned, picked up, delivered, with cancellation until pickup and an ETA shown to the customer.
 - **Live map** of agent positions (WebSockets + Redis pub/sub). Customers see only the agent on their own order.
 - **Fleet simulator** that moves agents, answers offers and creates orders, so the whole system can be watched running.
 
@@ -83,13 +86,30 @@ python scripts/simulate_agents.py        # 10 moving agents, a new order every 8
 python scripts/concurrency_test.py
 ```
 
+## Tests and CI
+
+23 automated tests run against a real PostgreSQL + PostGIS database (not mocks), because row locks, constraints and
+spatial queries only exist in a real database. They cover authorization, nearest-agent choice, accept / reject / expiry,
+the accept-versus-deadline race, the waiting queue, cancellation, the full order lifecycle, and a concurrency test
+(50 simultaneous requests for 15 agents, verifying no agent is ever double-booked).
+
+The concurrency test was checked by removing the `FOR UPDATE ... SKIP LOCKED` lock on purpose: without it, all 50
+requests succeeded for 15 agents (real double-booking) and the test failed. With the lock restored it passes.
+
+GitHub Actions runs the backend tests and a frontend build on every push (`.github/workflows/ci.yml`).
+
+Run the tests locally (Docker Desktop running):
+
+```powershell
+.\scripts\run_tests.ps1
+```
+
 ## Screenshots
 
 <!-- Add your screenshots here: admin map, offer card, customer tracking map -->
 
 ## What's not built yet
 
-- Automated test suite and CI pipeline
 - ETA based on real road routing (tracking currently shows straight-line distance)
 - Batch dispatch (assigning several orders to several agents at once) and a benchmark against the current greedy approach
 - Cloud deployment
