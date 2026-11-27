@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { getAuth } from "./api.js";
+import { getAuth, wsUrl } from "./api.js";
 
 /**
  * Opens a WebSocket at `path` (for example "/ws/live"), calls onEvent(parsedJson) for every message,
@@ -21,8 +21,7 @@ export function useSocket(path, onEvent) {
     const connect = () => {
       const auth = getAuth();
       if (!auth) return;
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${window.location.host}/api${path}?token=${auth.access_token}`);
+      ws = new WebSocket(wsUrl(path, auth.access_token));
       ws.onopen = () => setState("live");
       ws.onmessage = (e) => handler.current(JSON.parse(e.data));
       ws.onclose = (e) => {

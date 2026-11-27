@@ -1,4 +1,13 @@
-const BASE = "/api";
+// In development the Vite proxy serves the API under /api. When deployed, set VITE_API_URL to the API's address.
+const BASE = (import.meta.env.VITE_API_URL || "/api").replace(/\/$/, "");
+
+// Builds the WebSocket address for a path such as "/ws/live", for both setups.
+export function wsUrl(path, token) {
+  const base = BASE.startsWith("http")
+    ? BASE.replace(/^http/, "ws")
+    : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}${BASE}`;
+  return `${base}${path}?token=${token}`;
+}
 
 export function getAuth() {
   try {

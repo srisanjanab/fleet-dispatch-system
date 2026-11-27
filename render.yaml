@@ -1,0 +1,50 @@
+# Render Blueprint: creates the API, Redis and the website.
+# The database lives on Neon (a separate free Postgres service), so its connection string is asked for in the dashboard.
+# Values marked "sync: false" are asked for in the Render dashboard, so secrets never live in Git.
+services:
+  # ---- Redis-compatible store for live updates ----
+  - type: keyvalue
+    name: fleet-dispatch-redis
+    plan: free
+    ipAllowList: []          # internal connections only
+
+  # ---- the API (FastAPI in Docker) ----
+  - type: web
+    name: fleet-dispatch-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: fleet-dispatch-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+
+  # ---- the website (React, built to static files) ----
+  - type: web
+    name: fleet-dispatch-web
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: ./frontend/dist
+    routes:
+      - type: rewrite        # so refreshing /admin or /agent still loads the app
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: VITE_API_URL
+        sync: false

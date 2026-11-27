@@ -9,8 +9,10 @@ import asyncpg
 import jwt
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from . import auth as auth_module
 from .auth import (
     create_token, current_user, decode_token, ensure_self_or_admin,
     hash_password, require_roles, verify_password,
@@ -19,12 +21,54 @@ from .auth import (
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://dispatch:dispatch@localhost:5432/dispatch")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@example.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # dev default only
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 CHANNEL = os.getenv("EVENT_CHANNEL", "agent_events")  # Redis pub/sub channel for live agent updates
 logger = logging.getLogger("dispatch")
 OFFER_TIMEOUT = int(os.getenv("OFFER_TIMEOUT_SECONDS", "30"))   # how long an agent has to accept
 DISPATCH_INTERVAL = float(os.getenv("DISPATCH_INTERVAL_SECONDS", "2"))
 AUTO_DISPATCH = os.getenv("AUTO_DISPATCH", "true").lower() == "true"
+
+BASE_DDL = """
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TABLE IF NOT EXISTS agents (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'offline'
+                CHECK (status IN ('offline', 'available', 'busy')),
+    location    GEOGRAPHY(Point, 4326),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_agents_location ON agents USING GIST (location);
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents (status);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id             SERIAL PRIMARY KEY,
+    customer_name  TEXT NOT NULL,
+    pickup         GEOGRAPHY(Point, 4326) NOT NULL,
+    dropoff        GEOGRAPHY(Point, 4326) NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'created'
+                   CHECK (status IN ('created', 'assigned', 'picked_up', 'delivered', 'cancelled')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS assignments (
+    id           SERIAL PRIMARY KEY,
+    order_id     INT NOT NULL UNIQUE REFERENCES orders(id),
+    agent_id     INT NOT NULL REFERENCES agents(id),
+    assigned_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS location_history (
+    id           BIGSERIAL PRIMARY KEY,
+    agent_id     INT NOT NULL REFERENCES agents(id),
+    location     GEOGRAPHY(Point, 4326) NOT NULL,
+    recorded_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_location_history_agent_time ON location_history (agent_id, recorded_at DESC);
+"""
 
 USERS_DDL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -72,16 +116,27 @@ async def connect_with_retry():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if ENVIRONMENT == "production":
+        # Refuse to run online with the well-known development secrets
+        if auth_module.SECRET == "dev-secret-change-me" or ADMIN_PASSWORD == "admin123":
+            raise RuntimeError("Set JWT_SECRET and ADMIN_PASSWORD before running with ENVIRONMENT=production")
+
     app.state.pool = await connect_with_retry()
     app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     async with app.state.pool.acquire() as conn:
-        await conn.execute(USERS_DDL)  # idempotent: safe on every startup
-        exists = await conn.fetchval("SELECT 1 FROM users WHERE email=$1", ADMIN_EMAIL)
-        if not exists:
-            await conn.execute(
-                "INSERT INTO users (email, name, password_hash, role) VALUES ($1, 'Admin', $2, 'admin')",
-                ADMIN_EMAIL, hash_password(ADMIN_PASSWORD),
-            )
+        # The advisory lock makes this safe if several servers boot at the same moment
+        await conn.execute("SELECT pg_advisory_lock(727274)")
+        try:
+            await conn.execute(BASE_DDL)   # idempotent: safe on every startup
+            await conn.execute(USERS_DDL)
+            exists = await conn.fetchval("SELECT 1 FROM users WHERE email=$1", ADMIN_EMAIL)
+            if not exists:
+                await conn.execute(
+                    "INSERT INTO users (email, name, password_hash, role) VALUES ($1, 'Admin', $2, 'admin')",
+                    ADMIN_EMAIL, hash_password(ADMIN_PASSWORD),
+                )
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock(727274)")
     dispatcher = asyncio.create_task(dispatcher_loop()) if AUTO_DISPATCH else None
     yield
     if dispatcher:
@@ -91,6 +146,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Fleet Dispatch System", lifespan=lifespan)
+
+# The deployed website lives on a different domain than the API, so the browser needs explicit permission.
+# (In local development the Vite proxy makes this unnecessary, so it stays off unless CORS_ORIGINS is set.)
+if CORS_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 
 async def publish(event: dict) -> None:

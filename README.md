@@ -104,6 +104,11 @@ Run the tests locally (Docker Desktop running):
 .\scripts\run_tests.ps1
 ```
 
+## Deploying
+
+`render.yaml` and [DEPLOY.md](DEPLOY.md) describe a one-step deployment. The API creates its own database tables on first
+start and refuses to run in production with the default development passwords.
+
 ## Screenshots
 
 <!-- Add your screenshots here: admin map, offer card, customer tracking map -->
@@ -112,7 +117,7 @@ Run the tests locally (Docker Desktop running):
 
 - ETA based on real road routing (tracking currently shows straight-line distance)
 - Batch dispatch (assigning several orders to several agents at once) and a benchmark against the current greedy approach
-- Cloud deployment
+- A live deployment link (the configuration is ready, see DEPLOY.md)
 
 ## Tech stack
 

@@ -12,14 +12,16 @@ Ctrl+C stops everything.
 """
 import asyncio
 import json
+import os
 import random
 import sys
 
 import httpx
 import websockets
 
-HTTP = "http://localhost:8000"
-WS = "ws://localhost:8000"
+HTTP = os.getenv("FLEET_API", "http://localhost:8000").rstrip("/")   # set FLEET_API to simulate against a deployed server
+WS = HTTP.replace("http", "ws", 1)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 CENTER = (12.9716, 77.5946)
 TICK_SECONDS = 2
 
@@ -94,7 +96,7 @@ async def order_stream(c: httpx.AsyncClient, interval: float):
 
 async def main(n: int, order_interval: float):
     async with httpx.AsyncClient(base_url=HTTP, timeout=30) as c:
-        login = await c.post("/auth/login", json={"email": "admin@example.com", "password": "admin123"})
+        login = await c.post("/auth/login", json={"email": "admin@example.com", "password": ADMIN_PASSWORD})
         login.raise_for_status()
         token = login.json()["access_token"]
         c.headers["Authorization"] = f"Bearer {token}"

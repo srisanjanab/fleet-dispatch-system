@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, getAuth } from "../api.js";
+import { api, getAuth, wsUrl } from "../api.js";
 import { distanceKm } from "../geo.js";
 import { useSocket } from "../useSocket.js";
 import OrderTable from "./OrderTable.jsx";
@@ -57,8 +57,7 @@ export default function Agent() {
     }
 
     const auth = getAuth();
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${window.location.host}/api/ws/agents/${agentId}?token=${auth.access_token}`);
+    const ws = new WebSocket(wsUrl(`/ws/agents/${agentId}`, auth.access_token));
     let watchId;
 
     ws.onopen = () => {
